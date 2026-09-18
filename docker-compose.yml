@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: hubspot_deals_data
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password123
+    ports: ["5433:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U postgres -d hubspot_deals_data"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    ports: ["6380:6379"]
+  service:
+    build: .
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: hubspot_deals_data
+      DB_USER: postgres
+      DB_PASSWORD: password123
+      PORT: 5200
+    ports: ["5200:5200"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+volumes:
+  postgres_data:
