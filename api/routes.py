@@ -348,12 +348,13 @@ def health():
             }
         )
 
-    except Exception as exc:
+    except Exception:
+        log.exception("Health check failed")
         return jsonify(
             {
                 "status": "unhealthy",
                 "database": "unhealthy",
-                "error": str(exc),
+                "error": "Internal server error",
             }
         ), 503
 
