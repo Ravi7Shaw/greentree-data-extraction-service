@@ -1,10 +1,14 @@
-# Test Results
+# BE-2 validation evidence
 
-Automated unit coverage is included in `tests/`. Live HubSpot extraction evidence must be added after creating the required developer test account and five deals. No real access token is stored in this repository.
+Run from the repository with Python 3.12.11 and installed requirements:
 
-Required live validation:
-- `curl http://localhost:5200/api/health`
-- create a scan using a private-app token
-- verify 5 deal IDs in PostgreSQL
-- verify checkpoint/resume behavior
-- open `/docs/`
+```bash
+.venv/bin/python -m pytest -q -m 'not integration'
+BE2_INTEGRATION=1 .venv/bin/python -m pytest -q -m integration
+```
+
+The integration suite requires local MinIO and ClickHouse configured through `.env`. It creates unique disposable buckets/databases and removes them after each test. The HubSpot HTTP fixture contains synthetic records only.
+
+Assertions include all eight resource adapters; Coordinator signature tampering, nonce replay and tenant isolation; encrypted credentials; inclusive watermarks; checkpoint-after-load ordering; parallel worker overlap; pause/resume across supervisor restart; compressed Parquet in MinIO; deal/company/pipeline view results; and actual `SIGKILL` recovery. The crash test requires 16 physical ClickHouse rows and 16 current records after replay. The reporting query also retains a deal without a company.
+
+Real HubSpot account permissions and an external Coordinator have not been exercised. Do not present synthetic fixtures as evidence of live account extraction.

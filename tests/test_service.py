@@ -1,156 +1,6 @@
-import os
-
-os.environ.setdefault("DB_HOST", "localhost")
-
 from unittest.mock import Mock
 import pytest
-from marshmallow import ValidationError
-
-from services.data_source import transform_deal, create_deals_resource
 from services.hubspot_api_service import HubSpotDealsAPIService, HubSpotAPIError
-from api.schemas import StartScanSchema, PaginationSchema
-
-
-def test_transform_deal():
-    deal = {
-        "id": "1",
-        "properties": {
-            "dealname": "Test Deal",
-            "amount": "5000",
-            "dealstage": "closedwon",
-            "pipeline": "default",
-            "hs_lastmodifieddate": "2026-09-18T10:00:00Z",
-        },
-        "archived": False,
-    }
-
-    result = transform_deal(deal, "scan-1", "tenant-1")
-
-    assert result["id"] == "1"
-    assert result["dealname"] == "Test Deal"
-    assert result["amount"] == 5000.0
-    assert result["dealstage"] == "closedwon"
-    assert result["pipeline"] == "default"
-    assert result["_scan_id"] == "scan-1"
-    assert result["_tenant_id"] == "tenant-1"
-    assert result["archived"] is False
-
-
-def test_transform_invalid_amount():
-    deal = {
-        "id": "2",
-        "properties": {
-            "dealname": "Invalid Amount",
-            "amount": "not-a-number",
-        },
-    }
-
-    result = transform_deal(deal, "scan-2", "tenant-2")
-
-    assert result["id"] == "2"
-    assert result["amount"] is None
-
-
-def test_transform_missing_properties():
-    result = transform_deal(
-        {"id": "3"},
-        "scan-3",
-        "tenant-3",
-    )
-
-    assert result["id"] == "3"
-    assert result["dealname"] is None
-    assert result["amount"] is None
-    assert result["_scan_id"] == "scan-3"
-    assert result["_tenant_id"] == "tenant-3"
-
-
-def test_schema_defaults():
-    data = StartScanSchema().load(
-        {
-            "scanId": "scan-1",
-            "organizationId": "tenant-1",
-            "auth": {"accessToken": "token"},
-        }
-    )
-
-    assert data["type"] == "deals"
-    assert data["filters"] == {}
-
-
-def test_schema_requires_scan_id():
-    with pytest.raises(ValidationError):
-        StartScanSchema().load(
-            {"organizationId": "tenant-1", "auth": {"accessToken": "token"}}
-        )
-
-
-def test_schema_requires_organization_id():
-    with pytest.raises(ValidationError):
-        StartScanSchema().load({"scanId": "scan-1", "auth": {"accessToken": "token"}})
-
-
-def test_schema_requires_auth():
-    with pytest.raises(ValidationError):
-        StartScanSchema().load({"scanId": "scan-1", "organizationId": "tenant-1"})
-
-
-def test_pagination_defaults():
-    data = PaginationSchema().load({})
-
-    assert data["limit"] == 20
-    assert data["offset"] == 0
-
-
-def test_pagination_rejects_invalid_limit():
-    with pytest.raises(ValidationError):
-        PaginationSchema().load({"limit": 0})
-
-
-def test_pagination_rejects_negative_offset():
-    with pytest.raises(ValidationError):
-        PaginationSchema().load({"offset": -1})
-
-
-def test_iter_deals_pagination():
-    api = Mock(spec=HubSpotDealsAPIService)
-
-    api.iter_deals.return_value = iter(
-        [
-            (
-                1,
-                {
-                    "results": [
-                        {
-                            "id": "1",
-                            "properties": {"dealname": "Deal 1", "amount": "1000"},
-                        }
-                    ],
-                    "paging": {"next": {"after": "cursor-2"}},
-                },
-            ),
-            (
-                2,
-                {
-                    "results": [
-                        {
-                            "id": "2",
-                            "properties": {"dealname": "Deal 2", "amount": "2000"},
-                        }
-                    ]
-                },
-            ),
-        ]
-    )
-
-    resource = create_deals_resource(api, "token", "scan-1", "tenant-1")
-
-    deals = list(resource())
-
-    assert len(deals) == 2
-    assert deals[0]["id"] == "1"
-    assert deals[1]["id"] == "2"
-    assert deals[0]["_tenant_id"] == "tenant-1"
 
 
 def test_hubspot_missing_token():
@@ -255,3 +105,23 @@ def test_hubspot_iter_deals():
     assert len(pages) == 1
     assert pages[0][1]["results"][0]["id"] == "1"
     api._request.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "headers, expected",
+    [
+        ({"Retry-After": "2", "X-HubSpot-RateLimit-Interval-Milliseconds": "500"}, 2),
+        ({"X-HubSpot-RateLimit-Interval-Milliseconds": "1500"}, 1.5),
+        ({"Retry-After": "invalid"}, 1),
+    ],
+)
+def test_retry_header_precedence(monkeypatch, headers, expected):
+    sleep = Mock()
+    monkeypatch.setattr("services.hubspot_api_service.time.sleep", sleep)
+    api = HubSpotDealsAPIService()
+    retry = Mock(status_code=429, headers=headers)
+    success = Mock(status_code=200, ok=True)
+    success.json.return_value = {"results": []}
+    api.session.get = Mock(side_effect=[retry, success])
+    api._request("token", "https://api.hubapi.com/test")
+    sleep.assert_called_once_with(expected)
