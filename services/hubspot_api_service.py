@@ -1,5 +1,7 @@
-import logging, time
-from typing import Any, Dict, Iterator, List, Optional
+import logging
+import time
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 import requests
 
 log = logging.getLogger(__name__)
@@ -57,24 +59,23 @@ class HubSpotDealsAPIService:
                         r.status_code,
                         True,
                     )
-                retry_after = r.headers.get("Retry-After") or r.headers.get(
-                    "X-HubSpot-RateLimit-Interval-Milliseconds"
-                )
-                delay = (
-                    float(retry_after) / 1000
-                    if retry_after
-                    and str(retry_after).isdigit()
-                    and "Milliseconds"
-                    in (
-                        "X-HubSpot-RateLimit-Interval-Milliseconds"
-                        if "X-HubSpot-RateLimit-Interval-Milliseconds" in r.headers
-                        else ""
-                    )
-                    else float(retry_after)
-                    if retry_after
-                    else self.retry_delay * (2**attempt)
-                )
-                time.sleep(min(delay, 60))
+                retry_after = r.headers.get("Retry-After")
+                interval = r.headers.get("X-HubSpot-RateLimit-Interval-Milliseconds")
+                delay = self.retry_delay * (2**attempt)
+                try:
+                    if retry_after is not None:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = (
+                                parsedate_to_datetime(retry_after)
+                                - datetime.now(timezone.utc)
+                            ).total_seconds()
+                    elif interval is not None:
+                        delay = float(interval) / 1000
+                except (ValueError, TypeError, OverflowError):
+                    pass
+                time.sleep(max(0, delay))
                 continue
             if r.status_code == 401:
                 raise HubSpotAPIError(
@@ -105,7 +106,7 @@ class HubSpotDealsAPIService:
             return False
 
     def get_deal_properties(self, token):
-        return self._request(token, self.properties_endpoint)
+        return self._request(token, self.base_url + self.properties_endpoint)
 
     def iter_deals(self, token, limit=100, properties=None, archived=False, after=None):
         props = properties or [

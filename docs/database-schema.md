@@ -1,46 +1,25 @@
-# Database Schema
+# BE-2 storage schema
 
-The DLT destination is PostgreSQL. Deal rows use HubSpot `id` as the primary key and are stored in the configured `hubspot_deals` dataset.
+## SQLite journal (`STATE_DIR/state.sqlite3`)
 
-| Field | PostgreSQL type | Purpose |
-|---|---|---|
-| id | TEXT PRIMARY KEY | HubSpot deal ID |
-| dealname | TEXT | Deal name |
-| amount | NUMERIC | Monetary amount |
-| dealstage | TEXT | Deal stage |
-| pipeline | TEXT | Pipeline |
-| closedate | TIMESTAMPTZ/TEXT | Source close date |
-| createdate | TIMESTAMPTZ/TEXT | Source creation date |
-| lastmodifieddate | TIMESTAMPTZ/TEXT | Source modification date |
-| dealtype | TEXT | Deal type |
-| description | TEXT | Description |
-| archived | BOOLEAN | HubSpot archived flag |
-| _extracted_at | TIMESTAMPTZ | ETL extraction timestamp |
-| _scan_id | TEXT | Extraction scan identifier |
-| _tenant_id | TEXT | HubSpot portal/tenant identifier |
+`scans` stores unique ID, tenant, encrypted HubSpot credential, creation timestamp and JSON lifecycle/checkpoints. Removed scans leave an ID/tenant tombstone and erase the encrypted credential. `watermarks` stores completed updated-at cursors per tenant/resource. `nonces` stores consumed Coordinator nonces until expiration. WAL and `synchronous=FULL` protect atomic commits across process crashes. Back up the directory consistently and retain `TOKEN_ENCRYPTION_KEY` separately.
 
-Recommended indexes: `(_tenant_id)`, `(_tenant_id, dealstage)`, `(_tenant_id, closedate)`, and `(_tenant_id, _extracted_at)`.
+Each resource checkpoint records `cursor` (next page), `page`, `records`, `done`, `watermark` (run's lower bound), `updated_at` (maximum observed), and `pending` (durable payload/batch metadata). A pending payload is cleared only after both storage systems acknowledge the load.
 
-Multi-tenant isolation is enforced by carrying `_tenant_id` on every extracted record and filtering API results by the tenant associated with each scan.
+## MinIO
 
-Conceptual DDL:
-```sql
-CREATE TABLE deals (
-  id TEXT PRIMARY KEY,
-  dealname TEXT,
-  amount NUMERIC,
-  dealstage TEXT,
-  pipeline TEXT,
-  closedate TIMESTAMPTZ,
-  createdate TIMESTAMPTZ,
-  lastmodifieddate TIMESTAMPTZ,
-  dealtype TEXT,
-  description TEXT,
-  archived BOOLEAN NOT NULL DEFAULT FALSE,
-  _extracted_at TIMESTAMPTZ NOT NULL,
-  _scan_id TEXT NOT NULL,
-  _tenant_id TEXT NOT NULL
-);
-CREATE INDEX ix_deals_tenant_stage ON deals (_tenant_id, dealstage);
-CREATE INDEX ix_deals_tenant_close ON deals (_tenant_id, closedate);
-```
+Bucket: `MINIO_BUCKET`. dlt filesystem destination uses S3 credentials and the configured endpoint. Files are compressed Parquet with stable columns: `id`, `resource`, `properties`, `payload`, `company_ids`, `archived`, `scan_id`, `tenant_id`, `updated_at`, `extracted_at`, `batch_id`, plus dlt metadata.
+
+`properties` and `payload` are JSON strings: new/custom fields survive schema changes and nested owner/pipeline/engagement data is retained. `company_ids` preserves deal/company associations. Dataset path: `hubspot/<resource>/year=YYYY/month=MM/tenant=<sha256>/<batch-id>/`. dlt also writes its internal metadata under the dataset.
+
+## ClickHouse
+
+`hubspot_batches`: MergeTree, partitioned by deterministic page batch ID, ordered by `(tenant_id, resource, id)`. Each page loads through a `stage_<batch-id>` table then `REPLACE PARTITION`. A crash at any point can retry the page; readers see complete partition replacements. Source history across different scans intentionally remains in this table.
+
+`hubspot_records`: latest-value view grouped by `(tenant_id, resource, id)` using updated-at timestamp, extraction timestamp and batch ID as a deterministic version tuple. It exposes one record per source identity even across repeated snapshots.
+
+`v_hubspot_deal_pipeline`: analytical LEFT JOIN of current non-archived deals, associated companies and deal pipelines with tenant predicates in both joins. One row per deal/company association; a deal with no company retains a row. Multiple associated companies intentionally produce multiple reporting rows, so aggregate deal amounts at deal grain.
+
+The API's old PostgreSQL tables are no longer used. Existing legacy ClickHouse `deals`/`hubspot_records` tables are not migrated automatically: use a new `CLICKHOUSE_DATABASE` or migrate them before startup. The new implementation expects `hubspot_records` to be a view. No historical data is deleted by this change.
+
+Retention and partition compaction must be designed for production volume. Dropping scan metadata does not delete output or watermarks.

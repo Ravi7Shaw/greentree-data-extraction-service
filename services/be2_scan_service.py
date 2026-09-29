@@ -1,72 +1,114 @@
-from __future__ import annotations
+"""Single process supervisor; independent resources execute in worker threads."""
 
-from datetime import datetime, timezone
-from threading import Lock
-from typing import Any
+import fcntl
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, RLock
 
+from config import Config
 from services.pipeline.be2_controller import BE2PipelineController
-from services.pipeline.hubspot_pipeline import HubSpotDealsPipeline
+from services.pipeline.hubspot_pipeline import HubSpotBE2Pipeline
+from services.storage_service import StorageService
+
+log = logging.getLogger(__name__)
 
 
 class BE2ScanService:
-    """
-    Thin orchestration layer between the Flask API and the BE-2 pipeline.
+    def __init__(self, controller=None, storage=None, pipeline=None):
+        self.controller = controller or BE2PipelineController(
+            Config.STATE_DIR, Config.TOKEN_ENCRYPTION_KEY
+        )
+        self.storage = storage or StorageService(self.controller.root)
+        self.pipeline = pipeline or HubSpotBE2Pipeline(self.controller, self.storage)
+        self.stopping = Event()
+        self.lock = RLock()
+        self.futures = {}
+        self.executor = ThreadPoolExecutor(max_workers=Config.MAX_CONCURRENT_SCANS)
+        self.process_lock = None
 
-    Keeps scan state in the existing BE-2 controller while delegating
-    extraction/storage to HubSpotDealsPipeline.
-    """
-
-    def __init__(self):
-        self.controller = BE2PipelineController()
-        self._lock = Lock()
-        self._pipelines: dict[str, HubSpotDealsPipeline] = {}
-
-    def create(self, scan_id: str, tenant_id: str, token: str, filters: dict[str, Any]):
-        with self._lock:
-            self.controller.create_run(
-                scan_id,
-                resources=["deals", "companies", "contacts"],
-            )
-
-            self._pipelines[scan_id] = HubSpotDealsPipeline(
-                access_token=token,
-                tenant_id=tenant_id,
-                scan_id=scan_id,
-                filters=filters,
-                controller=self.controller,
-            )
-
-        return {
-            "scanId": scan_id,
-            "status": "pending",
-            "createdAt": datetime.now(timezone.utc).isoformat(),
-        }
-
-    def run(self, scan_id: str):
-        pipeline = self._pipelines.get(scan_id)
-
-        if pipeline is None:
-            raise ValueError(f"BE-2 pipeline not found for scan {scan_id}")
-
-        self.controller.start(scan_id)
-
+    def start(self):
+        self.process_lock = open(self.controller.root / "worker.lock", "a")
         try:
-            result = pipeline.run()
-            self.controller.complete(scan_id)
-            return result
-        except Exception as exc:
-            self.controller.fail(scan_id, str(exc))
-            raise
+            fcntl.flock(self.process_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.process_lock.close()
+            raise RuntimeError("Only one API worker may own a STATE_DIR") from None
+        for state in self.controller.list():
+            if state["status"] in ("pausing", "cancelling"):
+                self.controller.finish(state["scanId"])
+            elif state["status"] in ("pending", "running"):
+                self.submit(state["scanId"])
 
-    def pause(self, scan_id: str):
-        self.controller.pause(scan_id)
+    def submit(self, scan_id):
+        with self.lock:
+            previous = self.futures.get(scan_id)
+            if previous and not previous.done():
+                return
+            self.futures[scan_id] = self.executor.submit(self.run, scan_id)
 
-    def resume(self, scan_id: str):
-        self.controller.resume(scan_id)
+    def run(self, scan_id):
+        try:
+            with self.lock:
+                state = self.controller.get(scan_id)
+                if state["status"] == "pending":
+                    self.controller.transition(scan_id, {"pending"}, "running")
+            self.pipeline.run(scan_id, self.stopping)
+        except Exception:
+            # Do not persist provider response bodies or credentials in API errors.
+            log.error("Scan %s failed; inspect provider/storage availability", scan_id)
 
-    def state(self, scan_id: str):
-        return self.controller.get_state(scan_id)
+            def fail(state):
+                if state["status"] in ("pausing", "cancelling"):
+                    state["status"] = (
+                        "paused" if state["status"] == "pausing" else "cancelled"
+                    )
+                else:
+                    state["status"] = "failed"
+                state["error"] = (
+                    "Ingestion failed; resume retries the durable pending page"
+                )
 
-    def remove(self, scan_id: str):
-        with self._lock:
-            self._pipelines.pop(scan_id, None)
+            self.controller.mutate(scan_id, fail)
+
+    def create(self, scan_id, tenant, token, resources, limit):
+        with self.lock:
+            state, duplicate = self.controller.create(
+                scan_id, tenant, token, resources, limit
+            )
+            if not duplicate:
+                self.submit(scan_id)
+            return state, duplicate
+
+    def control(self, scan_id, action):
+        with self.lock:
+            if action == "pause":
+                return self.controller.transition(
+                    scan_id, {"pending", "running"}, "pausing"
+                )
+            if action == "cancel":
+                state = self.controller.transition(
+                    scan_id,
+                    {"pending", "running", "pausing", "paused", "failed"},
+                    "cancelling",
+                )
+                future = self.futures.get(scan_id)
+                if not future or future.done():
+                    state = self.controller.finish(scan_id)
+                return state
+            # A previous worker must fully exit before resume schedules its successor.
+            future = self.futures.get(scan_id)
+            if future and not future.done():
+                from services.pipeline.be2_controller import ScanConflict
+
+                raise ScanConflict(
+                    "Worker is still stopping; retry resume after it exits"
+                )
+            state = self.controller.transition(scan_id, {"paused", "failed"}, "pending")
+            self.submit(scan_id)
+            return state
+
+    def close(self):
+        self.stopping.set()
+        self.executor.shutdown(wait=True)
+        if self.process_lock:
+            self.process_lock.close()

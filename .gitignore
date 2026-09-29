@@ -5,3 +5,4 @@ __pycache__/
 .dlt/*
 logs/*
 *.pyc
+.pipeline_state/
